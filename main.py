@@ -2,25 +2,32 @@
 
 The case gives hour 1's print and 38-42 past big launches' hourly category
 counts, each from 14 days before its own release day to 3 days after.  Those
-launches are the model.  For every comparable we take its log-ratio curve
+launches are the model.
 
-    r_c(h) = ln(v_c(h) / v_c(1)),   h = 1..24
+Two views of them are combined.  Each comparable becomes a log-ratio curve
+r(h) = ln(v(h) / v(1)) at hour offsets from its own release-day midnight, which
+removes the launch's size and keeps the shape: how the audience moved on from
+the first hour of its release day.  Across the comparables, ln v(h) is also fit
+on ln v(1) hour by hour (weighted least squares), so a launch whose first hour
+is small or large gets a shape read off the level it actually had.  The centre
+of the forecast is that fitted line at the case's own hour-1 print; the width
+comes from the spread of the comparables' shapes about their weighted median.
 
-at hour offsets h-1 from its own release-day midnight: that cancels the
-launch's size and keeps its shape, how the audience moved on from the first
-hour of its release day.  Hour 1 of the case anchors the level; the shape is a
-weighted median of the comparables' shapes, and the spread is the same
-weighted distribution of shapes, scaled to its calibrated width.
+Comparables are weighted by how close their hour-1 print is to the case's (in
+logs), by recency, and by tier: a release day contaminated by an earlier
+early-access release, or a free-to-play or slow-burn launch, counts for less,
+since GTA VI is a paid console launch.  Comparables whose first hour sat far
+below their own day's peak (an unlock later in the day, so their hour 1 was
+pre-release and their shape belongs to a different clock) are dropped.
 
-A comparable counts more when its hour-1 level is close to the case's (in
-logs), when its jump into hour 1 relative to its own preceding six hours looks
-like the case's, and when it is recent.  Launches whose release day was
-contaminated by an earlier early-access release count less; free-to-play and
-slow-burn launches less still, since GTA VI is a paid console launch.
+The case's own hour 1 is the first hour of the UTC day while the game unlocks
+at midnight local time, so the United States joins hours later and the day's
+audience keeps climbing into the American afternoon; a small positive tilt with
+the hour carries that, and it is what the practice launches show.
 
 Reads every *.in under MAKEFUN_INPUT_DIR (default /input), writes <id>.out
-under MAKEFUN_OUTPUT_DIR (default /output).  Standard library only, no
-network, deterministic, far under the 8 s cap.
+under MAKEFUN_OUTPUT_DIR (default /output).  Standard library only, no network,
+deterministic, far under the 8 second cap.
 """
 
 import json
@@ -32,13 +39,17 @@ from pathlib import Path
 LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 Z = (-1.6449, -0.6745, 0.0, 0.6745, 1.6449)   # standard normal at those levels
 
-# Calibrated by leave-one-launch-out pinball loss over the kit's comparables.
-SIGMA_LEVEL = 1.2     # log tolerance on the hour-1 level match
-SIGMA_RAMP = 3.0      # log tolerance on the pre-launch ramp match
+# Calibrated on the kit's four practice launches and on leave-one-out fits over
+# the comparables themselves.
+SIGMA_LEVEL = 0.9     # log tolerance on the hour-1 level match
 DECAY = 0.4           # per-year weight decay towards older launches
-K_SPREAD = 0.75       # scale on the comparables' own shape spread
+RIDGE = 0.05          # ridge on the per-hour log-log fit
+TILT = 0.3            # log widening of the centre by hour after noon
+K_SPREAD = 0.70       # scale on the comparables' own shape spread
 SIGMA_0 = 0.06        # unmodelled drift, per sqrt(hour - 1)
-TIER_W = {"comp": 1.0, "ea": 0.6, "weak": 0.25}
+V0R_LO = 0.05         # drop comparables whose hour 1 was under 5% of their peak
+V0R_HI = 1.0
+TIER_W = {"comp": 1.0, "ea": 0.55, "weak": 0.25}
 
 
 def ts(value):
@@ -59,29 +70,19 @@ def tier_of(comp):
     return "comp"
 
 
-def hourly_offsets(hourly, base_ts):
-    """Hour offset from the release-day midnight -> viewers."""
+def hourly_offsets(hourly, base):
     out = {}
     for row in hourly or ():
         viewers = row.get("viewers")
         if not isinstance(viewers, (int, float)):
             continue
         try:
-            off = int(round((ts(row["from"]) - base_ts) / 3600.0))
+            off = int(round((ts(row["from"]) - base) / 3600.0))
         except Exception:
             continue
         if -200 <= off <= 200:
             out[off] = float(viewers)
     return out
-
-
-def ramp(curve):
-    """ln(v(hour 1) / mean of the six hours before release day), or None."""
-    v0 = curve.get(0)
-    prev = [max(curve[-o], 1.0) for o in range(1, 7) if curve.get(-o) is not None]
-    if not v0 or not prev:
-        return None
-    return math.log(max(v0, 1.0) / max(sum(prev) / len(prev), 1.0))
 
 
 def shape_of(curve):
@@ -114,8 +115,21 @@ def wquantile(pairs, q):
     return pairs[-1][0]
 
 
-def candidates(case, p1, target_ramp, target_year):
-    """(shape, weight) for every usable comparable."""
+def wls(xs, ys, ws):
+    """Weighted least squares y = a + b x, with a ridge on the slope."""
+    sw = sum(ws)
+    if sw <= 0:
+        return 0.0, 0.0
+    mx = sum(w * x for x, w in zip(xs, ws)) / sw
+    my = sum(w * y for x, y, w in zip(xs, ys, ws)) / sw
+    sxx = sum(w * (x - mx) ** 2 for x, w in zip(xs, ws)) + RIDGE
+    sxy = sum(w * (x - mx) * (y - my) for x, y, w in zip(xs, ys, ws))
+    slope = sxy / sxx if sxx > 1e-12 else 0.0
+    return my - slope * mx, slope
+
+
+def candidates(case, p1, target_year):
+    """(log v1, shape, weight) for every usable comparable."""
     bars = []
     for comp in case.get("comparables") or ():
         tier = tier_of(comp)
@@ -129,29 +143,19 @@ def candidates(case, p1, target_ramp, target_year):
         shape = shape_of(curve)
         if shape is None:
             continue
-        v0 = max(curve.get(0) or 1.0, 1.0)
+        peak = max([curve.get(o) or 0.0 for o in range(24)])
+        v0 = curve.get(0) or 0.0
+        if peak <= 0 or not (V0R_LO <= v0 / peak <= V0R_HI):
+            continue
         weight = TIER_W.get(tier, 0.25) * math.exp(-((math.log(v0 / p1)) / SIGMA_LEVEL) ** 2)
-        r = ramp(curve)
-        if r is not None and target_ramp is not None:
-            weight *= math.exp(-((r - target_ramp) / SIGMA_RAMP) ** 2)
         try:
             year = int(str(comp.get("day_start"))[:4])
         except Exception:
             year = target_year
         weight *= math.exp(-DECAY * max(0, target_year - year))
-        if weight > 1e-9:
-            bars.append((shape, weight))
+        if weight > 1e-12:
+            bars.append((math.log(max(v0, 1.0)), shape, weight))
     return bars
-
-
-def target_ramp_of(case):
-    """The case's own ramp into hour 1, from history_hourly against day_start."""
-    try:
-        base = ts(case["day_start"])
-    except Exception:
-        return None
-    curve = hourly_offsets(case.get("history_hourly"), base)
-    return ramp(curve)
 
 
 def forecast_case(case):
@@ -163,33 +167,36 @@ def forecast_case(case):
         except Exception:
             p1 = 1.0
     p1 = max(p1, 1.0)
+    log_p1 = math.log(p1)
 
     try:
         target_year = int(str(case.get("day_start"))[:4])
     except Exception:
         target_year = 2026
 
-    bars = candidates(case, p1, target_ramp_of(case), target_year)
+    bars = candidates(case, p1, target_year)
     hours = [row.get("hour") for row in (case.get("forecast") or ()) if row.get("hour")]
     if not hours:
         hours = list(range(2, 25))
 
-    log_p1 = math.log(p1)
     out = {"hours": []}
     for h in sorted(set(hours)):
-        centre = log_p1
-        qs = []
+        tilt = TILT * max(0.0, h - 12) / 10.0
         if bars:
-            pairs = [(shape[h - 1], weight) for shape, weight in bars]
+            xs = [b[0] for b in bars]
+            ys = [b[0] + b[1][h - 1] for b in bars]
+            ws = [b[2] for b in bars]
+            intercept, slope = wls(xs, ys, ws)
+            centre = intercept + slope * log_p1 + tilt
+            pairs = [(b[1][h - 1], b[2]) for b in bars]
             med = wquantile(pairs, 0.5)
-            centre = log_p1 + med
-            widening = SIGMA_0 * math.sqrt(h - 1)
-            for tau, z in zip(LEVELS, Z):
-                edge = (wquantile(pairs, tau) - med) * K_SPREAD
-                qs.append(math.exp(centre + edge + z * widening))
+            widths = [(wquantile(pairs, tau) - med) * K_SPREAD for tau in LEVELS]
         else:
-            widening = SIGMA_0 * math.sqrt(h - 1)
-            qs = [math.exp(centre + z * widening) for z in Z]
+            centre = log_p1
+            widths = [0.0] * 5
+        qs = []
+        for wdt, z in zip(widths, Z):
+            qs.append(math.exp(centre + wdt + z * SIGMA_0 * math.sqrt(h - 1)))
         floor = math.exp(centre) * 1e-3
         qs = [max(q, floor) for q in qs]
         for i in range(1, 5):
