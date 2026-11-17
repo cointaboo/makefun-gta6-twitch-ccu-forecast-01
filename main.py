@@ -11,7 +11,8 @@ the first hour of its release day.  Across the comparables, ln v(h) is also fit
 on ln v(1) hour by hour (weighted least squares), so a launch whose first hour
 is small or large gets a shape read off the level it actually had.  The centre
 of the forecast is that fitted line at the case's own hour-1 print; the width
-comes from the spread of the comparables' shapes about their weighted median.
+is a robust scale of the fit's residuals, sigma = sqrt(wmedian(resid^2)),
+turned into quantiles as K_SPREAD * z * sigma.
 
 Comparables are weighted by how close their hour-1 print is to the case's (in
 logs), by recency, and by tier: a release day contaminated by an earlier
@@ -45,8 +46,7 @@ SIGMA_LEVEL = 0.85    # log tolerance on the hour-1 level match
 DECAY = 0.4           # per-year weight decay towards older launches
 RIDGE = 0.05          # ridge on the per-hour log-log fit
 TILT = 0.4            # log widening of the centre, per hour after noon
-K_SPREAD = 0.62       # scale on the comparables' own shape spread
-SIGMA_0 = 0.05        # unmodelled drift, per sqrt(hour - 1)
+K_SPREAD = 0.80       # scale on the robust residual sigma
 V0R_LO = 0.05         # drop comparables whose hour 1 was under 5% of their peak
 V0R_HI = 1.0
 TIER_W = {"comp": 1.0, "ea": 0.55, "weak": 0.25}
@@ -188,15 +188,26 @@ def forecast_case(case):
             ws = [b[2] for b in bars]
             intercept, slope = wls(xs, ys, ws)
             centre = intercept + slope * log_p1 + tilt
-            pairs = [(b[1][h - 1], b[2]) for b in bars]
-            med = wquantile(pairs, 0.5)
-            widths = [(wquantile(pairs, tau) - med) * K_SPREAD for tau in LEVELS]
+            # Width from the fit's own residuals, not from the spread of the
+            # comparables' shape quantiles.  A shape curve r(h) only divides out
+            # each launch's own hour 1, so two comparables with the same
+            # underlying shape but different levels still land at different
+            # r(h) -- the slope term is exactly what carries that level
+            # difference.  Taking a quantile spread of the raw shapes about
+            # their median therefore counts the between-comparable level gaps
+            # as if they were shape uncertainty, and the band comes out too
+            # wide (and lopsided, since the shape distribution is skewed).  The
+            # residuals resid = y - (intercept + slope*x) are what the fit did
+            # not explain; a weighted median of resid^2 is a robust scale of
+            # that, immune to a single odd launch.
+            resid2 = [((y - (intercept + slope * x)) ** 2, w)
+                      for x, y, w in zip(xs, ys, ws)]
+            sigma = math.sqrt(max(wquantile(resid2, 0.5), 0.0))
+            widths = [K_SPREAD * z * sigma for z in Z]
         else:
             centre = log_p1
             widths = [0.0] * 5
-        qs = []
-        for wdt, z in zip(widths, Z):
-            qs.append(math.exp(centre + wdt + z * SIGMA_0 * math.sqrt(h - 1)))
+        qs = [math.exp(centre + wdt) for wdt in widths]
         floor = math.exp(centre) * 1e-3
         qs = [max(q, floor) for q in qs]
         for i in range(1, 5):
