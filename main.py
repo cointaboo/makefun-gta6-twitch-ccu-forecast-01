@@ -41,12 +41,12 @@ Z = (-1.6449, -0.6745, 0.0, 0.6745, 1.6449)   # standard normal at those levels
 
 # Calibrated on the kit's four practice launches and on leave-one-out fits over
 # the comparables themselves.
-SIGMA_LEVEL = 0.9     # log tolerance on the hour-1 level match
+SIGMA_LEVEL = 0.85    # log tolerance on the hour-1 level match
 DECAY = 0.4           # per-year weight decay towards older launches
 RIDGE = 0.05          # ridge on the per-hour log-log fit
-TILT = 0.3            # log widening of the centre by hour after noon
-K_SPREAD = 0.70       # scale on the comparables' own shape spread
-SIGMA_0 = 0.06        # unmodelled drift, per sqrt(hour - 1)
+TILT = 0.4            # log widening of the centre, per hour after noon
+K_SPREAD = 0.62       # scale on the comparables' own shape spread
+SIGMA_0 = 0.05        # unmodelled drift, per sqrt(hour - 1)
 V0R_LO = 0.05         # drop comparables whose hour 1 was under 5% of their peak
 V0R_HI = 1.0
 TIER_W = {"comp": 1.0, "ea": 0.55, "weak": 0.25}
